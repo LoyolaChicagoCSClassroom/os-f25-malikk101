@@ -92,7 +92,7 @@ void main(void) {
     puts("\r\n");
 
     /* demo scroll: print a few extra lines */
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 40; ++i) {
         puts("Line "); print_uint(i); puts(": scrolling test...\r\n");
     }
 
