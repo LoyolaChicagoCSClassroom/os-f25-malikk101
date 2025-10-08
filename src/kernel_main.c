@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include "interrupt.h"
 
 /* -------- Multiboot2 header (required) -------- */
 #define MULTIBOOT2_HEADER_MAGIC 0xe85250d6
@@ -79,6 +80,12 @@ static void print_uint(unsigned int x) {
 
 /* -------- Kernel entry -------- */
 void main(void) {
+    /* enable interrupts (Assignment 2) */
+    remap_pic();      // set up PIC
+    load_gdt();       // load GDT (includes TSS slot)
+    init_idt();       // build IDT
+    __asm__ __volatile__("sti");  // enable interrupts
+
     clear_screen();
 
     /* compute current privilege level (CPL = CS & 0x3) */
@@ -100,5 +107,3 @@ void main(void) {
     for (;;)
         __asm__ __volatile__("hlt");
 }
-
-	
