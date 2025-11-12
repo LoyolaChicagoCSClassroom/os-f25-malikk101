@@ -88,9 +88,7 @@ void main(void) {
     __asm__ __volatile__("sti");  // enable interrupts
 
     clear_screen();
-    extern unsigned int _end_kernel;
-    unsigned int total_mem_bytes = 128u * 1024u * 1024u; /* temp: QEMU default */
-    init_pfa_list(total_mem_bytes, (unsigned int)&_end_kernel);
+    init_pfa_list();
     puts("PFA init called.\r\n");
 
     /* compute current privilege level (CPL = CS & 0x3) */
@@ -105,20 +103,26 @@ void main(void) {
 
     /* demo scroll: print a few extra lines */
     /* --- test physical page allocator --- */
-    unsigned int a = allocate_physical_pages(1);
-    puts("alloc 1 page -> "); print_uint(a); puts("\r\n");
-    unsigned int b = allocate_physical_pages(2);
-    puts("alloc 2 pages -> "); print_uint(b); puts("\r\n");
-    free_physical_pages(a, 1);
-    puts("freed 1 page starting at "); print_uint(a); puts("\r\n");
-    unsigned int c = allocate_physical_pages(1);
-    puts("alloc again 1 page -> "); print_uint(c); puts("\r\n");
+    struct ppage* a = allocate_physical_pages(1);
+    puts("alloc 1 page -> "); print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0)); puts("\r\n");
+    struct ppage* b = allocate_physical_pages(2);
+    puts("alloc 2 pages -> "); print_uint((unsigned int)(b ? (unsigned int)b->physical_addr : 0)); puts("\r\n");
+    free_physical_pages(a);
+    puts("freed 1 page starting at "); print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0)); puts("\r\n");
+    struct ppage* c = allocate_physical_pages(1);
+    puts("alloc again 1 page -> "); print_uint((unsigned int)(c ? (unsigned int)c->physical_addr : 0)); puts("\r\n");
     /* --- end test --- */
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 40; ++i) {
         puts("Line "); print_uint(i); puts(": scrolling test...\r\n");
     }
 
     /* idle forever */
+    puts("PFA post-loop check...\r\n");
+    struct ppage* d = allocate_physical_pages(1);
+    puts("post alloc 1 page -> "); print_uint((unsigned int)(d ? (unsigned int)d->physical_addr : 0)); puts("\r\n");
+    free_physical_pages(d);
+    struct ppage* e = allocate_physical_pages(1);
+    puts("post alloc again -> "); print_uint((unsigned int)(e ? (unsigned int)e->physical_addr : 0)); puts("\r\n");
     for (;;)
         __asm__ __volatile__("hlt");
 }

@@ -1,51 +1,83 @@
 #include "page.h"
-#include <stdint.h>
-#include <stddef.h>
 
-#define PAGE_SIZE 4096u
-#define FREE_STACK_CAP 4096u  /* up to 4096 single pages cached */
+/* Assignment: 128 physical pages, each 2 MiB, covering 256 MiB total. */
+#define NPHYS_PAGES 128u
+#define FRAME_SIZE  (2u * 1024u * 1024u) /* 2 MiB */
 
-static uint32_t g_total_mem_bytes = 0;
-static uint32_t g_kernel_end = 0;
-static uint32_t g_next_free = 0;
+static struct ppage physical_page_array[NPHYS_PAGES];
 
-/* LIFO stack of freed single pages */
-static uint32_t free_stack[FREE_STACK_CAP];
-static size_t   free_top = 0;
+/* Head of the doubly-linked free list of pages */
+static struct ppage *free_head = 0;
 
-static inline uint32_t align_up_page(uint32_t x) {
-    uint32_t rem = x % PAGE_SIZE;
-    return rem ? (x + (PAGE_SIZE - rem)) : x;
+/* ---- minimal list helpers (internal) ---- */
+static inline void list_push_front(struct ppage **head, struct ppage *node) {
+    if (!node) return;
+    node->prev = 0;
+    node->next = *head;
+    if (*head) (*head)->prev = node;
+    *head = node;
 }
-static inline uint32_t align_down_page(uint32_t x) {
-    return x - (x % PAGE_SIZE);
+static inline struct ppage* list_pop_front(struct ppage **head) {
+    struct ppage *n = *head;
+    if (!n) return 0;
+    *head = n->next;
+    if (*head) (*head)->prev = 0;
+    n->next = n->prev = 0;
+    return n;
 }
-
-void init_pfa_list(uint32_t total_mem_bytes, uint32_t kernel_end) {
-    g_total_mem_bytes = align_down_page(total_mem_bytes);
-    g_kernel_end      = align_up_page(kernel_end);
-    g_next_free       = g_kernel_end;
-    free_top          = 0;
-}
-
-/* For n==1: try pop from free stack; else bump-allocate contiguous n pages */
-uint32_t allocate_physical_pages(size_t n) {
-    if (n == 0) return 0;
-    if (n == 1 && free_top > 0) {
-        return free_stack[--free_top];
+static inline struct ppage* list_concat_front(struct ppage **head, struct ppage *lst) {
+    /* splice lst (which may be a multi-node list) to the front of *head */
+    if (!lst) return *head;
+    /* find tail of lst */
+    struct ppage *tail = lst;
+    while (tail->next) tail = tail->next;
+    /* stitch: lst + head */
+    if (*head) {
+        (*head)->prev = tail;
+        tail->next = *head;
     }
-    uint32_t size = (uint32_t)n * PAGE_SIZE;
-    if (g_next_free + size > g_total_mem_bytes) return 0; /* OOM */
-    uint32_t ret = g_next_free;
-    g_next_free += size;
-    return ret;
+    *head = lst;
+    return *head;
 }
 
-/* For n==1: push on free stack (best-effort). Multi-page frees are ignored for now. */
-void free_physical_pages(uint32_t paddr, size_t n) {
-    if (n == 1 && free_top < FREE_STACK_CAP) {
-        free_stack[free_top++] = paddr;
-        return;
+/* PDF: init_pfa_list(void) — link every element into the free list and set physical_addr */
+void init_pfa_list(void) {
+    free_head = 0;
+    for (unsigned i = 0; i < NPHYS_PAGES; ++i) {
+        struct ppage *p = &physical_page_array[i];
+        p->next = p->prev = 0;
+        p->physical_addr = (void*)(i * FRAME_SIZE);
+        list_push_front(&free_head, p);
     }
-    (void)paddr; (void)n; /* ignore larger runs in this minimal version */
+}
+
+/* PDF: allocate_physical_pages(npages) — unlink npages from free list and return a new list */
+struct ppage* allocate_physical_pages(unsigned int npages) {
+    if (npages == 0) return 0;
+
+    /* Ensure enough pages exist; if not, do nothing and return 0 */
+    unsigned count = 0;
+    for (struct ppage *cur = free_head; cur && count < npages; cur = cur->next) count++;
+    if (count < npages) return 0;
+
+    /* Pop npages from free_head, chaining them into allocd list (front insertion) */
+    struct ppage *allocd = 0;
+    for (unsigned i = 0; i < npages; ++i) {
+        struct ppage *n = list_pop_front(&free_head);
+        /* insert n at front of allocd */
+        n->next = allocd;
+        if (allocd) allocd->prev = n;
+        allocd = n;
+        n->prev = 0;
+    }
+    return allocd;
+}
+
+/* PDF: free_physical_pages(list) — return the list to the free list */
+void free_physical_pages(struct ppage *ppage_list) {
+    if (!ppage_list) return;
+    /* make sure list prev is clean */
+    ppage_list->prev = 0;
+    /* concatenate to free_head */
+    list_concat_front(&free_head, ppage_list);
 }

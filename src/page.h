@@ -4,8 +4,15 @@
 #include <stdint.h>
 #include <stddef.h>
 
-void init_pfa_list(uint32_t total_mem_bytes, uint32_t kernel_end);
-uint32_t allocate_physical_pages(size_t n);
-void free_physical_pages(uint32_t paddr, size_t n);
+struct ppage {
+    struct ppage *next;
+    struct ppage *prev;
+    void *physical_addr;
+};
+
+/* PDF-required API */
+void              init_pfa_list(void);
+struct ppage*     allocate_physical_pages(unsigned int npages);
+void              free_physical_pages(struct ppage *ppage_list);
 
 #endif
