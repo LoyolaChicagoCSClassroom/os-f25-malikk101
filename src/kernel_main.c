@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "interrupt.h"
+#include "page.h"
 
 /* -------- Multiboot2 header (required) -------- */
 #define MULTIBOOT2_HEADER_MAGIC 0xe85250d6
@@ -87,6 +88,10 @@ void main(void) {
     __asm__ __volatile__("sti");  // enable interrupts
 
     clear_screen();
+    extern unsigned int _end_kernel;
+    unsigned int total_mem_bytes = 128u * 1024u * 1024u; /* temp: QEMU default */
+    init_pfa_list(total_mem_bytes, (unsigned int)&_end_kernel);
+    puts("PFA init called.\r\n");
 
     /* compute current privilege level (CPL = CS & 0x3) */
     unsigned short cs;
@@ -99,7 +104,17 @@ void main(void) {
     puts("\r\n");
 
     /* demo scroll: print a few extra lines */
-    for (int i = 0; i < 40; ++i) {
+    /* --- test physical page allocator --- */
+    unsigned int a = allocate_physical_pages(1);
+    puts("alloc 1 page -> "); print_uint(a); puts("\r\n");
+    unsigned int b = allocate_physical_pages(2);
+    puts("alloc 2 pages -> "); print_uint(b); puts("\r\n");
+    free_physical_pages(a, 1);
+    puts("freed 1 page starting at "); print_uint(a); puts("\r\n");
+    unsigned int c = allocate_physical_pages(1);
+    puts("alloc again 1 page -> "); print_uint(c); puts("\r\n");
+    /* --- end test --- */
+    for (int i = 0; i < 5; ++i) {
         puts("Line "); print_uint(i); puts(": scrolling test...\r\n");
     }
 
