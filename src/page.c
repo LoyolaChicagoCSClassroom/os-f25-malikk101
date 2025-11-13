@@ -81,3 +81,47 @@ void free_physical_pages(struct ppage *ppage_list) {
     /* concatenate to free_head */
     list_concat_front(&free_head, ppage_list);
 }
+
+/* ===== A4 paging bits (i386 4KiB pages) ===== */
+#include <stdint.h>
+
+/* Global, page-aligned directory and one page table (covers first 4 MiB). */
+struct page_directory_entry g_pd[1024] __attribute__((aligned(4096)));
+struct page                 g_pt0[1024] __attribute__((aligned(4096)));
+
+/* Map a linked list of physical pages starting at vaddr.
+   For A4 we only need PDE index 0 (addresses < 4 MiB). */
+void *map_pages(void *vaddr, struct ppage *pglist, struct page_directory_entry *pd) {
+    uintptr_t va = (uintptr_t)vaddr;
+    struct ppage *p = pglist;
+
+    while (p) {
+        unsigned pde = (va >> 22) & 0x3FF;   /* top 10 bits */
+        unsigned pti = (va >> 12) & 0x3FF;   /* next 10 bits */
+
+        /* Ensure PDE present and points to our first page table (4KiB pages). */
+        if (!pd[pde].present) {
+            /* For this assignment we expect pde == 0 (first 4 MiB). */
+            pd[pde].present = 1;
+            pd[pde].rw      = 1;
+            pd[pde].user    = 0;
+            pd[pde].pagesize= 0; /* 0 => 4KiB pages */
+            pd[pde].frame   = ((uint32_t)(uintptr_t)g_pt0) >> 12;
+        }
+
+        /* Grab the page table (only g_pt0 for this assignment). */
+        struct page *pt = g_pt0;
+
+        /* Fill the PT entry for this VA with the physical frame from pglist. */
+        pt[pti].present = 1;
+        pt[pti].rw      = 1;
+        pt[pti].user    = 0;
+        pt[pti].frame   = ((uint32_t)(uintptr_t)p->physical_addr) >> 12;
+
+        /* Advance one page and one node. */
+        va += 4096u;
+        p = p->next;
+    }
+
+    return vaddr;
+}

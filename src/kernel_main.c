@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include "interrupt.h"
 #include "page.h"
+extern struct page_directory_entry g_pd[1024];
+static inline unsigned int align_up_page(unsigned int x){ unsigned int r=x & 0xFFF; return r? (x + (0x1000 - r)) : x; }
+static inline void loadPageDirectory(struct page_directory_entry *pd){ __asm__ __volatile__("mov %0, %%cr3" :: "r"(pd) : ); }
 
 /* -------- Multiboot2 header (required) -------- */
 #define MULTIBOOT2_HEADER_MAGIC 0xe85250d6
@@ -100,11 +103,37 @@ void main(void) {
     puts("Current execution level (CPL/ring): ");
     print_uint(cpl);
     puts("\r\n");
+    /* A4: identity-map kernel [0x100000, &_end_kernel) */
+    extern unsigned int _end_kernel;
+    unsigned int va = 0x00100000u;
+    unsigned int vend = align_up_page((unsigned int)&_end_kernel);
+    while (va < vend) {
+        struct ppage tmp; tmp.next = 0; tmp.prev = 0; tmp.physical_addr = (void*)va;
+        map_pages((void*)va, &tmp, g_pd);
+        va += 0x1000u;
+    }
 
     /* demo scroll: print a few extra lines */
     /* --- test physical page allocator --- */
     struct ppage* a = allocate_physical_pages(1);
     puts("alloc 1 page -> "); print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0)); puts("\r\n");
+    /* A4: identity-map current stack page (from ESP) */
+    unsigned int esp; __asm__ __volatile__("mov %%esp, %0" : "=r"(esp));
+    unsigned int esp_page = esp & ~0xFFFu;
+    { struct ppage st; st.next=0; st.prev=0; st.physical_addr=(void*)esp_page;
+      map_pages((void*)esp_page, &st, g_pd); }
+
+    /* A4: identity-map VGA text buffer at 0xB8000 */
+    { struct ppage vg; vg.next=0; vg.prev=0; vg.physical_addr=(void*)0x000B8000u;
+      map_pages((void*)0x000B8000u, &vg, g_pd); }
+
+    /* A4: set CR3 to our page directory, then enable paging (PG|PE) */
+    loadPageDirectory(g_pd);
+    __asm__ __volatile__(
+        "mov %cr0, %eax\n"
+        "or  $0x80000001, %eax\n"
+        "mov %eax, %cr0"
+    );
     struct ppage* b = allocate_physical_pages(2);
     puts("alloc 2 pages -> "); print_uint((unsigned int)(b ? (unsigned int)b->physical_addr : 0)); puts("\r\n");
     free_physical_pages(a);
