@@ -18,9 +18,9 @@
 
 #include <stdint.h>
 #include "interrupt.h"
-
+#include "screen.h"
+#include "page.h"
 /* we print with putc() from your VGA text driver */
-extern void putc(int data);
 
 struct idt_entry idt_entries[256];
 struct idt_ptr   idt_ptr;

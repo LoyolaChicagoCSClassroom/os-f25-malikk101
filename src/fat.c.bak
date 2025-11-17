@@ -1,0 +1,162 @@
+#include "fat.h"
+#include "sd.h"
+
+/* Cached BPB values and derived layout */
+static unsigned int g_bps, g_spc, g_rs, g_nf, g_spf, g_nroot;
+static unsigned int g_first_fat_sector, g_root_dir_sector, g_root_dir_sectors, g_first_data_sector;
+
+/* Little-endian helper */
+static unsigned int rd16(const unsigned char *p){
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+}
+
+/* Make 8.3 uppercase name padded with spaces */
+static void to_83(const char *name, char out[11]){
+    for (int i=0;i<11;i++) out[i] = ' ';
+    int base = 0, ext = 8, in_ext = 0;
+    for (const char *p = name; *p; ++p){
+        char c = *p;
+        if (c == '.') { in_ext = 1; continue; }
+        if (c >= 'a' && c <= 'z') c -= 32; /* uppercase */
+        if (in_ext){
+            if (ext < 11) out[ext++] = c;
+        } else {
+            if (base < 8) out[base++] = c;
+        }
+    }
+}
+
+/* Initialize FAT16 at LBA 2048 (your build creates this) */
+int fatInit(void){
+    unsigned char bs[SECTOR_SIZE];
+
+    /* Boot sector of the FAT16 partition starts at absolute LBA 2048 */
+    if (sd_readblock(2048, bs, 1) != 0) return -1;
+
+    g_bps   = rd16(&bs[11]);  /* bytes per sector (expect 512) */
+    g_spc   = bs[13];         /* sectors per cluster (e.g., 4) */
+    g_rs    = rd16(&bs[14]);  /* reserved sectors (e.g., 4) */
+    g_nf    = bs[16];         /* number of FATs */
+    g_nroot = rd16(&bs[17]);  /* root dir entries */
+    g_spf   = rd16(&bs[22]);  /* sectors per FAT (FAT16) */
+
+    /* Layout (absolute LBAs) */
+    g_first_fat_sector  = 2048 + g_rs;
+    g_root_dir_sector   = g_first_fat_sector + g_nf * g_spf;
+    g_root_dir_sectors  = ((g_nroot * 32) + (g_bps - 1)) / g_bps;
+    g_first_data_sector = g_root_dir_sector + g_root_dir_sectors;
+
+    if (g_bps != SECTOR_SIZE || g_spc == 0 || g_nf == 0 || g_spf == 0) return -1;
+    return 0;
+}
+
+/* Open by 8.3 name in the root directory */
+int fatOpen(const char *name, struct file *out){
+    unsigned char target[11];
+    to_83(name, (char*)target);
+
+    unsigned char sec[SECTOR_SIZE];
+    for (unsigned int s = 0; s < g_root_dir_sectors; ++s){
+        if (sd_readblock(g_root_dir_sector + s, sec, 1) != 0) return -1;
+
+        for (int i = 0; i < (int)(SECTOR_SIZE/32); ++i){
+            unsigned char *e = &sec[i*32];
+            if (e[0] == 0x00) return -1;   /* end of entries */
+            if (e[0] == 0xE5) continue;    /* deleted */
+            if (e[11] == 0x0F) continue;   /* LFN */
+
+            /* compare 11-byte name */
+            int match = 1;
+            for (int k=0;k<11;k++){ if (e[k] != target[k]) { match = 0; break; } }
+            if (!match) continue;
+
+            /* Fill struct file */
+            for (int k=0;k<8;k++) out->rde.file_name[k] = e[k];
+            for (int k=0;k<3;k++) out->rde.file_extension[k] = e[8+k];
+            out->rde.attribute = e[11];
+            out->rde.file_size = (unsigned int)e[28]
+                               | ((unsigned int)e[29]<<8)
+                               | ((unsigned int)e[30]<<16)
+                               | ((unsigned int)e[31]<<24);
+            out->rde.cluster = rd16(&e[26]);
+            out->start_cluster = out->rde.cluster;
+            out->pos = 0; /* start of file */
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* First sector of a data cluster */
+unsigned int fatFirstSectorOfCluster(unsigned int cluster){ 
+    if (cluster < 2) cluster = 2;
+    return g_first_data_sector + (cluster - 2) * g_spc;
+}
+
+/* Get next cluster in FAT16 chain */
+static unsigned int fatNextCluster(unsigned int cluster){
+    /* EOC short-circuit */
+    if (cluster >= 0xFFF8) return cluster;
+
+    unsigned char sec[SECTOR_SIZE];
+    unsigned int fat_offset = cluster * 2;                  /* 2 bytes per FAT16 entry */
+    unsigned int fat_sec_ix = fat_offset / g_bps;
+    unsigned int fat_off    = fat_offset % g_bps;
+
+    if (sd_readblock(g_first_fat_sector + fat_sec_ix, sec, 1) != 0) return 0xFFFF;
+    unsigned int val = rd16(&sec[fat_off]);
+    return val;
+}
+
+/* Read possibly across sectors and clusters, advancing f->pos */
+int fatRead(struct file *f, void *buf, unsigned int nbytes){
+    if (!f || !buf) return -1;
+    unsigned int file_size = f->rde.file_size;
+    if (f->pos >= file_size) return 0;
+    if (nbytes == 0) return 0;
+    unsigned int want = nbytes;
+    unsigned int remain = file_size - f->pos;
+    if (want > remain) want = remain;
+
+    unsigned int cluster_size = g_spc * g_bps;
+    unsigned int pos = f->pos;
+    unsigned int cluster = f->start_cluster;
+
+    /* advance to cluster containing current file position */
+    unsigned int skips = pos / cluster_size;
+    for (unsigned int i=0; i<skips; i++){
+        unsigned int next = fatNextCluster(cluster);
+        if (next >= 0xFFF8 || next == 0) break;
+        cluster = next;
+    }
+
+    unsigned int off_in_cluster   = pos % cluster_size;
+    unsigned int sector_in_cluster= off_in_cluster / g_bps;
+    unsigned int off_in_sector    = off_in_cluster % g_bps;
+
+    unsigned char sec[SECTOR_SIZE];
+    unsigned char *dst = (unsigned char*)buf;
+    unsigned int copied = 0;
+
+    while (copied < want){
+        unsigned int lba = fatFirstSectorOfCluster(cluster) + sector_in_cluster;
+        if (sd_readblock(lba, sec, 1) != 0) break;
+        unsigned int can  = g_bps - off_in_sector;
+        unsigned int need = want - copied;
+        unsigned int take = (can < need ? can : need);
+        for (unsigned int i=0; i<take; i++) dst[copied + i] = sec[off_in_sector + i];
+        copied += take;
+        off_in_sector = 0;
+        sector_in_cluster++;
+        if (sector_in_cluster >= g_spc){
+            sector_in_cluster = 0;
+            unsigned int next = fatNextCluster(cluster);
+            if (next >= 0xFFF8 || next == 0) break;
+            cluster = next;
+        }
+    }
+
+    f->pos += copied;
+    f->cur_cluster = cluster;
+    return (int)copied;
+}

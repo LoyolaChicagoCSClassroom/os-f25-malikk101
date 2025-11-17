@@ -1,100 +1,45 @@
 #include <stdint.h>
 #include "interrupt.h"
 #include "page.h"
-extern struct page_directory_entry g_pd[1024];
-static inline unsigned int align_up_page(unsigned int x){ unsigned int r=x & 0xFFF; return r? (x + (0x1000 - r)) : x; }
-static inline void loadPageDirectory(struct page_directory_entry *pd){ __asm__ __volatile__("mov %0, %%cr3" :: "r"(pd) : ); }
+#include "fat.h"
+#include "sd.h"
+
+/* -------- Multiboot2 header (required) -------- */
+#include <stdint.h>
+#include "interrupt.h"
+#include "page.h"
+#include "fat.h"
+#include "sd.h"
+#include "screen.h"
 
 /* -------- Multiboot2 header (required) -------- */
 #define MULTIBOOT2_HEADER_MAGIC 0xe85250d6
 const unsigned int multiboot_header[]
 __attribute__((section(".multiboot"))) =
 {
-    MULTIBOOT2_HEADER_MAGIC,              /* magic */
-    0,                                    /* architecture = i386 */
-    16,                                   /* header length */
-    -(16 + MULTIBOOT2_HEADER_MAGIC),      /* checksum */
-    0, 12                                 /* end tag (type=0, size=12) */
+    MULTIBOOT2_HEADER_MAGIC,
+    0,                     /* i386 */
+    16,                    /* header length */
+    -(16 + MULTIBOOT2_HEADER_MAGIC),
+    0, 12
 };
 
 /* -------- Port I/O helper -------- */
 uint8_t inb(uint16_t _port) {
     uint8_t rv;
-    __asm__ __volatile__ ("inb %1, %0" : "=a"(rv) : "dN"(_port));
+    __asm__ __volatile__("inb %1, %0" : "=a"(rv) : "dN"(_port));
     return rv;
 }
 
-/* -------- Simple VGA text-mode terminal driver -------- */
-#define VGA_W      80
-#define VGA_H      25
-#define VGA_COLOR  0x07  /* light gray on black */
-static volatile uint16_t *const VGA = (uint16_t*)0xB8000;
-static int cur_row = 0, cur_col = 0;
+/* ------------------------------------------------------- */
+/* ----------------------   MAIN   ------------------------ */
+/* ------------------------------------------------------- */
 
-static inline void vga_put_at(char ch, int r, int c) {
-    VGA[r * VGA_W + c] = ((uint16_t)VGA_COLOR << 8) | (uint8_t)ch;
-}
+void main() {
 
-static void scroll_if_needed(void) {
-    if (cur_row < VGA_H) return;
-    /* scroll up by one row */
-    for (int r = 1; r < VGA_H; ++r) {
-        for (int c = 0; c < VGA_W; ++c) {
-            VGA[(r - 1) * VGA_W + c] = VGA[r * VGA_W + c];
-        }
-    }
-    /* clear last row */
-    for (int c = 0; c < VGA_W; ++c) {
-        VGA[(VGA_H - 1) * VGA_W + c] = ((uint16_t)VGA_COLOR << 8) | ' ';
-    }
-    cur_row = VGA_H - 1;
-}
-
-static void clear_screen(void) {
-    for (int r = 0; r < VGA_H; ++r) {
-        for (int c = 0; c < VGA_W; ++c) {
-            VGA[r * VGA_W + c] = ((uint16_t)VGA_COLOR << 8) | ' ';
-        }
-    }
-    cur_row = 0;
-    cur_col = 0;
-}
-
-void putc(int data) {
-    char ch = (char)data;
-
-    if (ch == '\r') { cur_col = 0; return; }
-    if (ch == '\n') { cur_col = 0; cur_row++; scroll_if_needed(); return; }
-    if (ch == '\t') { int n = 4 - (cur_col & 3); while (n--) putc(' '); return; }
-
-    vga_put_at(ch, cur_row, cur_col);
-    if (++cur_col >= VGA_W) { cur_col = 0; cur_row++; }
-    scroll_if_needed();
-}
-
-static void puts(const char *s) { while (*s) putc(*s++); }
-
-static void print_uint(unsigned int x) {
-    char buf[10]; int i = 0;
-    if (x == 0) { putc('0'); return; }
-    while (x && i < (int)sizeof(buf)) { buf[i++] = '0' + (x % 10); x /= 10; }
-    while (i--) putc(buf[i]);
-}
-/* -------- end terminal driver -------- */
-
-/* -------- Kernel entry -------- */
-void main(void) {
-    /* enable interrupts (Assignment 2) */
-    remap_pic();      // set up PIC
-    load_gdt();       // load GDT (includes TSS slot)
-    init_idt();       // build IDT
-    __asm__ __volatile__("sti");  // enable interrupts
-
-    clear_screen();
-    init_pfa_list();
     puts("PFA init called.\r\n");
 
-    /* compute current privilege level (CPL = CS & 0x3) */
+    /* Print privilege level */
     unsigned short cs;
     __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
     unsigned int cpl = cs & 0x3;
@@ -103,55 +48,101 @@ void main(void) {
     puts("Current execution level (CPL/ring): ");
     print_uint(cpl);
     puts("\r\n");
-    /* A4: identity-map kernel [0x100000, &_end_kernel) */
-    extern unsigned int _end_kernel;
-    unsigned int va = 0x00100000u;
-    unsigned int vend = align_up_page((unsigned int)&_end_kernel);
-    while (va < vend) {
-        struct ppage tmp; tmp.next = 0; tmp.prev = 0; tmp.physical_addr = (void*)va;
-        map_pages((void*)va, &tmp, g_pd);
-        va += 0x1000u;
+
+    /* ------------------ Paging (Assignment 4) ------------------ */
+    init_pfa_list();   /* your Assignment 4 function */
+
+    /* Scroll test */
+    for (int i = 0; i < 8; ++i) {
+        puts("Line ");
+        print_uint(i);
+        puts(": scrolling test...\r\n");
     }
 
-    /* demo scroll: print a few extra lines */
-    /* --- test physical page allocator --- */
+    /* ------------------ PFA Test ------------------ */
     struct ppage* a = allocate_physical_pages(1);
-    puts("alloc 1 page -> "); print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0)); puts("\r\n");
-    /* A4: identity-map current stack page (from ESP) */
-    unsigned int esp; __asm__ __volatile__("mov %%esp, %0" : "=r"(esp));
-    unsigned int esp_page = esp & ~0xFFFu;
-    { struct ppage st; st.next=0; st.prev=0; st.physical_addr=(void*)esp_page;
-      map_pages((void*)esp_page, &st, g_pd); }
+    puts("alloc 1 page -> ");
+    print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0));
+    puts("\r\n");
 
-    /* A4: identity-map VGA text buffer at 0xB8000 */
-    { struct ppage vg; vg.next=0; vg.prev=0; vg.physical_addr=(void*)0x000B8000u;
-      map_pages((void*)0x000B8000u, &vg, g_pd); }
-
-    /* A4: set CR3 to our page directory, then enable paging (PG|PE) */
-    loadPageDirectory(g_pd);
-    __asm__ __volatile__(
-        "mov %cr0, %eax\n"
-        "or  $0x80000001, %eax\n"
-        "mov %eax, %cr0"
-    );
     struct ppage* b = allocate_physical_pages(2);
-    puts("alloc 2 pages -> "); print_uint((unsigned int)(b ? (unsigned int)b->physical_addr : 0)); puts("\r\n");
-    free_physical_pages(a);
-    puts("freed 1 page starting at "); print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0)); puts("\r\n");
-    struct ppage* c = allocate_physical_pages(1);
-    puts("alloc again 1 page -> "); print_uint((unsigned int)(c ? (unsigned int)c->physical_addr : 0)); puts("\r\n");
-    /* --- end test --- */
-    for (int i = 0; i < 40; ++i) {
-        puts("Line "); print_uint(i); puts(": scrolling test...\r\n");
-    }
+    puts("alloc 2 pages -> ");
+    print_uint((unsigned int)(b ? (unsigned int)b->physical_addr : 0));
+    puts("\r\n");
 
-    /* idle forever */
+    free_physical_pages(a);
+    puts("freed 1 page starting at ");
+    print_uint((unsigned int)(a ? (unsigned int)a->physical_addr : 0));
+    puts("\r\n");
+
+    struct ppage* c = allocate_physical_pages(1);
+    puts("alloc again 1 page -> ");
+    print_uint((unsigned int)(c ? (unsigned int)c->physical_addr : 0));
+    puts("\r\n");
+
     puts("PFA post-loop check...\r\n");
     struct ppage* d = allocate_physical_pages(1);
-    puts("post alloc 1 page -> "); print_uint((unsigned int)(d ? (unsigned int)d->physical_addr : 0)); puts("\r\n");
+    puts("post alloc 1 page -> ");
+    print_uint((unsigned int)(d ? (unsigned int)d->physical_addr : 0));
+    puts("\r\n");
     free_physical_pages(d);
+
     struct ppage* e = allocate_physical_pages(1);
-    puts("post alloc again -> "); print_uint((unsigned int)(e ? (unsigned int)e->physical_addr : 0)); puts("\r\n");
-    for (;;)
-        __asm__ __volatile__("hlt");
+    puts("post alloc again -> ");
+    print_uint((unsigned int)(e ? (unsigned int)e->physical_addr : 0));
+    puts("\r\n");
+
+    /* ------------------ Assignment 5 ------------------ */
+
+    unsigned char sec[512];
+
+    puts("\r\nHW5 (late): reading MBR LBA0...\r\n");
+    if (sd_readblock(0, sec, 1) == 0) {
+        puts("MBR sig[510,511]=");
+        print_uint(sec[510]); putc(',');
+        print_uint(sec[511]);
+        puts("\r\n");
+    } else {
+        puts("MBR read FAIL\r\n");
+    }
+
+    puts("HW5 (late): reading FAT boot sector LBA2048...\r\n");
+    if (sd_readblock(2048, sec, 1) == 0) {
+        unsigned short bps = sec[11] | (sec[12]<<8);
+        unsigned char  spc = sec[13];
+        unsigned short rs  = sec[14] | (sec[15]<<8);
+
+        puts("BS: bps="); print_uint(bps);
+        puts(" spc="); print_uint(spc);
+        puts(" rs=");  print_uint(rs);
+        puts("\r\n");
+    } else {
+        puts("BS read FAIL\r\n");
+    }
+
+    if (fatInit()==0) puts("FAT init OK\r\n");
+    else puts("FAT init FAIL\r\n");
+
+    struct file F;
+    if (fatOpen("KERNEL", &F)==0) {
+        puts("fatOpen KERNEL: size=");
+        print_uint(F.rde.file_size);
+        puts(" clus=");
+        print_uint(F.start_cluster);
+        puts("\r\n");
+
+        unsigned char buf[512];
+        int n = fatRead(&F, buf, 512);
+
+        puts("fatRead first 32 bytes: ");
+        for (int i=0; i < (n<32?n:32); i++) {
+            print_uint(buf[i]);
+            putc(' ');
+        }
+        puts("\r\n");
+    } else {
+        puts("fatOpen KERNEL: FAIL\r\n");
+    }
+
+    for (;;) {}
 }
